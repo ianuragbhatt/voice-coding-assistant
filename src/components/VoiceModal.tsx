@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -44,16 +44,86 @@ export default function VoiceModal() {
   const { transcribe, error: sttError } = useSpeechToText();
   const { rephrase, error: llmError } = useLLMRephraser();
 
+  const hideWindow = useCallback(async () => {
+    const window = getCurrentWindow();
+    await window.hide();
+    setAppState("idle");
+    resetRecorder();
+  }, [resetRecorder]);
+
+  const handleStartRecording = useCallback(async () => {
+    resetRecorder();
+    setTranscribedText("");
+    setRephrasedText("");
+    setEditedText("");
+    setError(null);
+    await startRecording();
+  }, [resetRecorder, startRecording]);
+
+  const handleStopRecording = useCallback(async () => {
+    await stopRecording();
+  }, [stopRecording]);
+
+  const handleCancel = useCallback(async () => {
+    await hideWindow();
+  }, [hideWindow]);
+
+  const handleSend = useCallback(async () => {
+    try {
+      await invoke("type_text", { text: editedText });
+      await hideWindow();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to type text");
+    }
+  }, [editedText, hideWindow]);
+
+  const processAudio = useCallback(async (blob: Blob) => {
+    try {
+      setAppState("transcribing");
+
+      const text = await transcribe(blob);
+      setTranscribedText(text);
+
+      if (enableRephrasing) {
+        setAppState("rephrasing");
+        const rephrased = await rephrase(text);
+        setRephrasedText(rephrased);
+        setEditedText(rephrased);
+      } else {
+        setRephrasedText(text);
+        setEditedText(text);
+      }
+
+      setAppState("preview");
+
+      setTimeout(() => {
+        textareaRef.current?.focus();
+      }, 100);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to process audio");
+      setAppState("idle");
+    }
+  }, [transcribe, rephrase, enableRephrasing]);
+
   // Listen for toggle events from Rust
   useEffect(() => {
     const unlisten = listen<boolean>("voice:toggle", (event) => {
       if (event.payload) {
-        // Window is being shown, start recording
         handleStartRecording();
       } else {
-        // Window is being hidden, stop recording
         handleStopRecording();
       }
+    });
+
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [handleStartRecording, handleStopRecording]);
+
+  // Listen for open-settings event from tray menu
+  useEffect(() => {
+    const unlisten = listen("voice:open-settings", () => {
+      setShowSettings(true);
     });
 
     return () => {
@@ -74,7 +144,7 @@ export default function VoiceModal() {
     if (audioBlob && !isRecording) {
       processAudio(audioBlob);
     }
-  }, [audioBlob, isRecording]);
+  }, [audioBlob, isRecording, processAudio]);
 
   // Handle errors
   useEffect(() => {
@@ -84,73 +154,23 @@ export default function VoiceModal() {
     }
   }, [recorderError, sttError, llmError]);
 
-  const handleStartRecording = async () => {
-    resetRecorder();
-    setTranscribedText("");
-    setRephrasedText("");
-    setEditedText("");
-    setError(null);
-    await startRecording();
-  };
+  // Keyboard shortcuts in preview mode
+  useEffect(() => {
+    if (appState !== "preview") return;
 
-  const handleStopRecording = async () => {
-    await stopRecording();
-  };
-
-  const processAudio = async (blob: Blob) => {
-    try {
-      setAppState("transcribing");
-
-      // Transcribe audio
-      const text = await transcribe(blob);
-      setTranscribedText(text);
-
-      if (enableRephrasing) {
-        setAppState("rephrasing");
-        // Rephrase for coding agents
-        const rephrased = await rephrase(text);
-        setRephrasedText(rephrased);
-        setEditedText(rephrased);
-      } else {
-        setRephrasedText(text);
-        setEditedText(text);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleSend();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        handleCancel();
       }
+    };
 
-      setAppState("preview");
-
-      // Focus textarea
-      setTimeout(() => {
-        textareaRef.current?.focus();
-      }, 100);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to process audio");
-      setAppState("idle");
-    }
-  };
-
-  const handleSend = async () => {
-    try {
-      await invoke("type_text", { text: editedText });
-      await hideWindow();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to type text");
-    }
-  };
-
-  const handleRetry = () => {
-    handleStartRecording();
-  };
-
-  const handleCancel = async () => {
-    await hideWindow();
-  };
-
-  const hideWindow = async () => {
-    const window = getCurrentWindow();
-    await window.hide();
-    setAppState("idle");
-    resetRecorder();
-  };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [appState, handleSend, handleCancel]);
 
   const toggleRecording = () => {
     if (isRecording) {
@@ -159,6 +179,8 @@ export default function VoiceModal() {
       handleStartRecording();
     }
   };
+
+  const isMac = navigator.platform.includes("Mac");
 
   return (
     <div className="w-full h-screen bg-transparent flex items-center justify-center p-4">
@@ -311,7 +333,7 @@ export default function VoiceModal() {
                 {/* Actions */}
                 <div className="flex items-center justify-between">
                   <button
-                    onClick={handleRetry}
+                    onClick={() => handleStartRecording()}
                     className="glass-button flex items-center gap-2 text-white/70 hover:text-white"
                   >
                     <RefreshCw className="w-4 h-4" />
@@ -321,9 +343,10 @@ export default function VoiceModal() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={handleCancel}
-                      className="px-4 py-2 rounded-xl text-white/60 hover:text-white transition-colors"
+                      className="px-4 py-2 rounded-xl text-white/60 hover:text-white transition-colors flex items-center gap-1.5"
                     >
                       Cancel
+                      <kbd className="text-xs px-1.5 py-0.5 rounded bg-white/10 text-white/40">Esc</kbd>
                     </button>
                     <button
                       onClick={handleSend}
@@ -332,6 +355,9 @@ export default function VoiceModal() {
                     >
                       <Send className="w-4 h-4" />
                       Send
+                      <kbd className="text-xs px-1.5 py-0.5 rounded bg-white/20 text-white/70">
+                        {isMac ? "⌘" : "Ctrl"}↵
+                      </kbd>
                     </button>
                   </div>
                 </div>
@@ -353,9 +379,7 @@ export default function VoiceModal() {
                 <p className="text-white/40 text-center">
                   Press{" "}
                   <kbd className="px-2 py-1 rounded bg-white/10 text-white/60 text-sm">
-                    {navigator.platform.includes("Mac")
-                      ? "Cmd+Shift+V"
-                      : "Ctrl+Shift+V"}
+                    {isMac ? "Cmd+Shift+V" : "Ctrl+Shift+V"}
                   </kbd>{" "}
                   to start
                 </p>

@@ -1,3 +1,6 @@
+# Secrets
+opencode.json
+
 # Dependencies
 node_modules/
 package-lock.json
@@ -38,9 +41,12 @@ capabilities/**
 # Local env files
 .env
 .env.local
+.env.*
 .env.*.local
+*.env
 
 # Temporary files
 *.tmp
 *.temp
 .cache/
+.ruff_cache/

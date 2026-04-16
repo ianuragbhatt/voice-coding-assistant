@@ -23,7 +23,7 @@
     "security": {
       "csp": {
         "default-src": "'self'",
-        "connect-src": "'self' https://api.openai.com https://api.groq.com",
+        "connect-src": "'self' https: http:",
         "media-src": "'self' blob:",
         "script-src": "'self' 'unsafe-inline'",
         "style-src": "'self' 'unsafe-inline'"
@@ -46,7 +46,9 @@
             "store:allow-save",
             "global-shortcut:allow-is-registered",
             "global-shortcut:allow-register",
-            "global-shortcut:allow-unregister"
+            "global-shortcut:allow-unregister",
+            "core:tray:default",
+            "core:menu:default"
           ]
         }
       ]

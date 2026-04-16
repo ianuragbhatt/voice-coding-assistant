@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { Key, Mic, Brain, Save, Check } from "lucide-react";
+import { Key, Mic, Brain, Save, Check, Keyboard, Timer } from "lucide-react";
 
 interface SettingsPanelProps {
   enableRephrasing: boolean;
@@ -19,6 +19,10 @@ interface ProviderConfig {
 interface ProvidersConfig {
   stt: ProviderConfig;
   llm: ProviderConfig;
+}
+
+interface AppSettings {
+  silenceTimeoutMs: number;
 }
 
 export default function SettingsPanel({
@@ -39,7 +43,14 @@ export default function SettingsPanel({
       temperature: 0.3,
     },
   });
+  const [shortcut, setShortcut] = useState(
+    navigator.platform.includes("Mac") ? "cmd+shift+v" : "ctrl+shift+v"
+  );
+  const [appSettings, setAppSettings] = useState<AppSettings>({
+    silenceTimeoutMs: 3000,
+  });
   const [saved, setSaved] = useState(false);
+  const [shortcutError, setShortcutError] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
@@ -47,25 +58,42 @@ export default function SettingsPanel({
 
   const loadSettings = async () => {
     try {
-      const stored = await invoke<any>("get_store_value", { key: "providers" });
-      if (stored) {
-        setProviders(stored);
-      }
+      const [storedProviders, storedShortcut, storedSettings] =
+        await Promise.all([
+          invoke<any>("get_store_value", { key: "providers" }),
+          invoke<any>("get_store_value", { key: "shortcut" }),
+          invoke<any>("get_store_value", { key: "settings" }),
+        ]);
+
+      if (storedProviders) setProviders(storedProviders);
+      if (typeof storedShortcut === "string") setShortcut(storedShortcut);
+      if (storedSettings) setAppSettings(storedSettings);
     } catch (err) {
       console.error("Failed to load settings:", err);
     }
   };
 
   const saveSettings = async () => {
+    setShortcutError(null);
     try {
-      await invoke("set_store_value", {
-        key: "providers",
-        value: providers,
-      });
+      // Save providers and app settings
+      await Promise.all([
+        invoke("set_store_value", { key: "providers", value: providers }),
+        invoke("set_store_value", { key: "settings", value: appSettings }),
+      ]);
+
+      // Update shortcut (validates + re-registers in Rust)
+      await invoke("update_shortcut", { shortcut: shortcut.trim() });
+
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
-      console.error("Failed to save settings:", err);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.toLowerCase().includes("shortcut") || msg.toLowerCase().includes("invalid")) {
+        setShortcutError(msg);
+      } else {
+        console.error("Failed to save settings:", err);
+      }
     }
   };
 
@@ -76,12 +104,11 @@ export default function SettingsPanel({
   ) => {
     setProviders((prev) => ({
       ...prev,
-      [type]: {
-        ...prev[type],
-        [field]: value,
-      },
+      [type]: { ...prev[type], [field]: value },
     }));
   };
+
+  const silenceTimeoutSeconds = appSettings.silenceTimeoutMs / 1000;
 
   return (
     <motion.div
@@ -90,14 +117,14 @@ export default function SettingsPanel({
       exit={{ height: 0, opacity: 0 }}
       className="border-b border-white/10 bg-dark-900/50"
     >
-      <div className="p-4 max-h-[300px] overflow-y-auto">
+      <div className="p-4 max-h-[400px] overflow-y-auto">
         <h3 className="text-sm font-semibold text-white mb-4 flex items-center gap-2">
           <Key className="w-4 h-4" />
           Provider Configuration
         </h3>
 
         {/* Rephrasing Toggle */}
-        <div className="flex items-center justify-between mb-6 p-3 rounded-xl bg-white/5">
+        <div className="flex items-center justify-between mb-4 p-3 rounded-xl bg-white/5">
           <div className="flex items-center gap-2">
             <Brain className="w-4 h-4 text-purple-400" />
             <span className="text-sm text-white">AI Rephrasing</span>
@@ -114,6 +141,59 @@ export default function SettingsPanel({
               }`}
             />
           </button>
+        </div>
+
+        {/* Global Shortcut */}
+        <div className="mb-4">
+          <h4 className="text-xs text-white/40 mb-2 flex items-center gap-1">
+            <Keyboard className="w-3 h-3" />
+            Global Shortcut
+          </h4>
+          <input
+            type="text"
+            value={shortcut}
+            onChange={(e) => {
+              setShortcut(e.target.value);
+              setShortcutError(null);
+            }}
+            placeholder="e.g. cmd+shift+v"
+            className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
+          />
+          {shortcutError && (
+            <p className="text-xs text-red-400 mt-1">{shortcutError}</p>
+          )}
+          <p className="text-xs text-white/20 mt-1">
+            Use modifier keys: cmd, ctrl, shift, alt + key (e.g. cmd+shift+v)
+          </p>
+        </div>
+
+        {/* Silence Detection */}
+        <div className="mb-4">
+          <h4 className="text-xs text-white/40 mb-2 flex items-center gap-1">
+            <Timer className="w-3 h-3" />
+            Auto-stop after silence
+          </h4>
+          <div className="flex items-center gap-3">
+            <input
+              type="range"
+              min="0"
+              max="10"
+              step="0.5"
+              value={silenceTimeoutSeconds}
+              onChange={(e) =>
+                setAppSettings((prev) => ({
+                  ...prev,
+                  silenceTimeoutMs: parseFloat(e.target.value) * 1000,
+                }))
+              }
+              className="flex-1 accent-purple-500"
+            />
+            <span className="text-xs text-white/60 w-16 text-right">
+              {silenceTimeoutSeconds === 0
+                ? "Disabled"
+                : `${silenceTimeoutSeconds}s`}
+            </span>
+          </div>
         </div>
 
         {/* STT Provider */}

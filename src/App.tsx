@@ -43,13 +43,13 @@ function App() {
             <Settings className="w-8 h-8 text-purple-400" />
             <div>
               <p className="font-semibold text-white mb-1">Configuration</p>
-              <p className="text-white/50 text-sm">Right-click tray icon</p>
+              <p className="text-white/50 text-sm">Click the gear icon in the voice modal</p>
             </div>
           </div>
         </div>
 
         <div className="text-white/40 text-sm">
-          <p>The app is running in your system tray.</p>
+          <p>The app is running in the background.</p>
           <p>Press the shortcut anytime to open the voice interface.</p>
         </div>
       </div>

@@ -17,6 +17,8 @@ Voice Coding Assistant is a cross-platform desktop app that provides instant voi
 
 ## Documentation
 
+**IMPORTANT: On every code change, ALL relevant documentation MUST be updated. See "Documentation Requirements" in Contributing Guidelines for details.**
+
 ### User Documentation
 - **README.md** - User-facing documentation (setup, usage, features)
 - **CHANGELOG.md** - Version history and changes
@@ -29,6 +31,13 @@ Voice Coding Assistant is a cross-platform desktop app that provides instant voi
 
 ### API Documentation
 See "Component API Reference" section below for detailed API docs.
+
+### Documentation Update Policy
+Every PR/feature must include documentation updates:
+- README.md for user-facing changes
+- CHANGELOG.md for all changes (use [Unreleased] section)
+- AGENTS.md for architecture/development changes
+- Inline comments for code changes
 
 ## Tech Stack
 
@@ -53,14 +62,14 @@ See "Component API Reference" section below for detailed API docs.
 ## Architecture
 
 ```
-voice-coding-assistant/
+mac_voice_tool/                   # Repository root (was voice-coding-assistant/)
 ├── src/                          # React Frontend
 │   ├── components/
 │   │   ├── VoiceModal.tsx        # Main floating window UI
 │   │   ├── AudioVisualizer.tsx   # Real-time waveform
-│   │   └── SettingsPanel.tsx     # Provider configuration UI
+│   │   └── SettingsPanel.tsx     # Provider + shortcut + silence config UI
 │   ├── hooks/
-│   │   ├── useAudioRecorder.ts   # Web Audio API recording
+│   │   ├── useAudioRecorder.ts   # Web Audio API recording + silence detection
 │   │   ├── useSpeechToText.ts    # STT API integration
 │   │   └── useLLMRephraser.ts    # LLM rephrasing logic
 │   ├── App.tsx                   # Main app (hidden window)
@@ -68,16 +77,20 @@ voice-coding-assistant/
 │   └── index.css                 # Tailwind + custom styles
 ├── src-tauri/                    # Rust Backend
 │   ├── src/
-│   │   ├── main.rs               # App entry + shortcut handler
-│   │   ├── commands.rs           # Tauri commands
-│   │   ├── lib.rs                # Library exports
-│   │   └── keyboard.rs           # Text injection
+│   │   ├── main.rs               # App entry, shortcut registration, system tray
+│   │   ├── commands.rs           # Tauri commands + toggle_voice_modal
+│   │   └── lib.rs                # Library exports
 │   ├── icons/                    # App icons
 │   ├── Cargo.toml                # Rust dependencies
 │   └── tauri.conf.json           # Tauri configuration
-├── docs/                         # Additional documentation
-├── index.html / voice.html       # Entry HTML files
-└── AGENTS.md                     # This file
+├── index.html                    # Main window entry HTML
+├── voice.html                    # Voice modal entry HTML
+├── package.json                  # Frontend dependencies
+├── vite.config.ts                # Vite build config (dual entry points)
+├── tailwind.config.js            # Tailwind + custom dark/glass colors
+├── AGENTS.md                     # This file
+├── CLAUDE.md                     # Claude Code guidance
+└── CHANGELOG.md                  # Version history
 ```
 
 ## Window Structure
@@ -143,7 +156,7 @@ interface UseLLMRephraserReturn {
 
 ### Rust Commands
 ```rust
-// Type text at cursor position
+// Paste text at cursor via clipboard (save → set → Cmd/Ctrl+V → restore)
 #[tauri::command]
 pub async fn type_text(text: String) -> Result<(), String>
 
@@ -154,6 +167,10 @@ pub async fn get_store_value(app: AppHandle, key: String) -> Result<Option<Value
 // Set value in store
 #[tauri::command]
 pub async fn set_store_value(app: AppHandle, key: String, value: Value) -> Result<(), String>
+
+// Unregister current shortcut, register new one, persist to store
+#[tauri::command]
+pub async fn update_shortcut(app: AppHandle, shortcut: String) -> Result<(), String>
 ```
 
 ## Key Commands
@@ -210,6 +227,9 @@ Settings are stored in `settings.json` via tauri-plugin-store:
       "model": "gpt-4o-mini",
       "temperature": 0.3
     }
+  },
+  "settings": {
+    "silenceTimeoutMs": 3000
   }
 }
 ```
@@ -477,7 +497,43 @@ npm run tauri:build
 1. Create a feature branch
 2. Follow code style (see Code Style section)
 3. Add tests if applicable
-4. Update documentation
+4. **Update ALL relevant documentation** (see Documentation Requirements below)
+
+### Documentation Requirements
+
+**On every change, you MUST update:**
+
+1. **README.md** - If the change affects:
+   - Installation or setup process
+   - User-facing features
+   - Configuration options
+   - Usage examples
+   - Platform-specific instructions
+
+2. **CHANGELOG.md** - Add entry under `[Unreleased]`:
+   - All new features under "Added"
+   - Breaking changes under "Changed"
+   - Bug fixes under "Fixed"
+   - Security issues under "Security"
+
+3. **AGENTS.md** - If the change affects:
+   - Architecture or file structure
+   - API interfaces
+   - Build process
+   - Development workflow
+   - Common tasks or troubleshooting
+
+4. **Inline Documentation** - Always update:
+   - JSDoc comments for modified functions
+   - Rustdoc comments for modified Rust code
+   - TypeScript types and interfaces
+
+**Documentation Update Checklist:**
+- [ ] README.md reviewed and updated if needed
+- [ ] CHANGELOG.md updated with [Unreleased] entry
+- [ ] AGENTS.md reviewed and updated if needed
+- [ ] Code comments updated for modified functions
+- [ ] Type definitions updated
 
 ### Code Review Checklist
 - [ ] TypeScript compiles without errors
@@ -486,6 +542,10 @@ npm run tauri:build
 - [ ] Error handling is in place
 - [ ] Settings are persisted correctly
 - [ ] Global shortcut still works
+- [ ] **README.md updated** (if user-facing changes)
+- [ ] **CHANGELOG.md updated** (with [Unreleased] entry)
+- [ ] **AGENTS.md updated** (if architecture/dev workflow changes)
+- [ ] **Inline comments updated**
 
 ## File-by-File Documentation
 
@@ -588,6 +648,6 @@ Potential improvements documented here for reference:
 ---
 
 **Last Updated**: 2026-04-16
-**Version**: 1.0.0
+**Version**: 1.1.0
 **Maintainer**: Voice Coding Assistant Team
 **Documentation Status**: Complete
