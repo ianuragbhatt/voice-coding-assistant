@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Voice Coding Assistant",
+  "version": "1.0.0",
+  "identifier": "com.voicecodingassistant.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Voice Coding Assistant",
+        "label": "main",
+        "width": 800,
+        "height": 600,
+        "visible": false,
+        "skipTaskbar": true
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "'self' https://api.openai.com https://api.groq.com",
+        "media-src": "'self' blob:",
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'"
+      },
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "windows": ["voice-modal"],
+          "permissions": [
+            "core:default",
+            "core:window:allow-show",
+            "core:window:allow-hide",
+            "core:window:allow-center",
+            "core:window:allow-set-focus",
+            "core:window:allow-set-title-bar-style",
+            "shell:allow-open",
+            "store:default",
+            "store:allow-get",
+            "store:allow-set",
+            "store:allow-save",
+            "global-shortcut:allow-is-registered",
+            "global-shortcut:allow-register",
+            "global-shortcut:allow-unregister"
+          ]
+        }
+      ]
+    },
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [],
+    "copyright": "",
+    "category": "DeveloperTool",
+    "shortDescription": "Voice-to-text coding assistant",
+    "longDescription": "A voice-to-text assistant optimized for coding agents with AI rephrasing"
+  }
+}
