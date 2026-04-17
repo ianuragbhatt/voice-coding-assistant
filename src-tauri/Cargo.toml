@@ -24,6 +24,25 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 enigo = "0.2"
 clipboard-rs = "0.2"
+# HTTP client for model downloads (rustls for cross-platform TLS, no OpenSSL needed)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+# WAV file parsing for extracting PCM samples before whisper inference
+hound = "3.5"
+# Async stream utilities for chunked download progress
+futures-util = "0.3"
+# tokio async runtime (explicit to enable spawn_blocking for CPU-bound whisper inference)
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+# whisper.cpp bindings for local STT (CPU-only on Linux/Windows)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.13" }
+
+# whisper.cpp bindings with Metal GPU acceleration on macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.13", features = ["metal"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSRunningApplication"] }
 
 [profile.dev]
 incremental = true

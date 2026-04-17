@@ -38,6 +38,7 @@
             "core:window:allow-hide",
             "core:window:allow-center",
             "core:window:allow-set-focus",
+            "core:window:allow-set-size",
             "core:window:allow-set-title-bar-style",
             "shell:allow-open",
             "store:default",
@@ -69,6 +70,10 @@
     "copyright": "",
     "category": "DeveloperTool",
     "shortDescription": "Voice-to-text coding assistant",
-    "longDescription": "A voice-to-text assistant optimized for coding agents with AI rephrasing"
+    "longDescription": "A voice-to-text assistant optimized for coding agents with AI rephrasing",
+    "macOS": {
+      "entitlements": "./Entitlements.plist",
+      "infoPlist": "./Info.plist"
+    }
   }
 }

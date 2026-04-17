@@ -39,9 +39,9 @@ export function useSpeechToText(): UseSpeechToTextReturn {
         );
       }
 
-      // Convert Blob to File
-      const audioFile = new File([audioBlob], "audio.webm", {
-        type: "audio/webm",
+      // Convert Blob to File (WAV format — accepted by OpenAI Whisper and compatible APIs)
+      const audioFile = new File([audioBlob], "audio.wav", {
+        type: "audio/wav",
       });
 
       // Create FormData for the API request

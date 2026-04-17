@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { Key, Mic, Brain, Save, Check, Keyboard, Timer } from "lucide-react";
+import { Check, Save, Keyboard, Timer, Mic, Brain, Zap, ShieldCheck, ShieldAlert, Cpu } from "lucide-react";
+import ModelManager from "./ModelManager";
 
 interface SettingsPanelProps {
   enableRephrasing: boolean;
@@ -23,289 +24,385 @@ interface ProvidersConfig {
 
 interface AppSettings {
   silenceTimeoutMs: number;
+  sttMode: "local" | "api";
+  localModel: string;
 }
 
-export default function SettingsPanel({
-  enableRephrasing,
-  setEnableRephrasing,
-  onClose,
-}: SettingsPanelProps) {
+type Tab = "providers" | "general";
+
+interface PermissionState {
+  microphone: "granted" | "denied" | "prompt" | "unknown";
+  accessibility: boolean;
+}
+
+function Field({
+  label, type = "text", value, onChange, placeholder, mono = false,
+}: {
+  label: string; type?: string; value: string | number; onChange: (v: string) => void;
+  placeholder?: string; mono?: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <span className="text-xs text-neutral-500 w-14 shrink-0 text-right">{label}</span>
+      <input
+        type={type} value={value} onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className={`flex-1 px-2.5 py-1.5 rounded-md bg-neutral-800 border border-neutral-700 text-xs text-white
+                   placeholder-neutral-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20
+                   transition-all duration-150 ${mono ? "font-mono" : ""}`}
+      />
+    </div>
+  );
+}
+
+export default function SettingsPanel({ enableRephrasing, setEnableRephrasing, onClose }: SettingsPanelProps) {
+  const [tab, setTab] = useState<Tab>("providers");
   const [providers, setProviders] = useState<ProvidersConfig>({
-    stt: {
-      base_url: "https://api.openai.com/v1",
-      api_key: "",
-      model: "whisper-1",
-    },
-    llm: {
-      base_url: "https://api.openai.com/v1",
-      api_key: "",
-      model: "gpt-4o-mini",
-      temperature: 0.3,
-    },
+    stt: { base_url: "https://api.openai.com/v1", api_key: "", model: "whisper-1" },
+    llm: { base_url: "https://api.openai.com/v1", api_key: "", model: "gpt-4o-mini", temperature: 0.3 },
   });
   const [shortcut, setShortcut] = useState(
     navigator.platform.includes("Mac") ? "cmd+shift+v" : "ctrl+shift+v"
   );
   const [appSettings, setAppSettings] = useState<AppSettings>({
     silenceTimeoutMs: 3000,
+    sttMode: "api",
+    localModel: "base",
   });
   const [saved, setSaved] = useState(false);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [permissions, setPermissions] = useState<PermissionState>({
+    microphone: "unknown",
+    accessibility: true,
+  });
 
-  useEffect(() => {
-    loadSettings();
-  }, []);
+  useEffect(() => { loadSettings(); checkPermissions(); }, []);
 
   const loadSettings = async () => {
     try {
-      const [storedProviders, storedShortcut, storedSettings] =
-        await Promise.all([
-          invoke<any>("get_store_value", { key: "providers" }),
-          invoke<any>("get_store_value", { key: "shortcut" }),
-          invoke<any>("get_store_value", { key: "settings" }),
-        ]);
-
-      if (storedProviders) setProviders(storedProviders);
-      if (typeof storedShortcut === "string") setShortcut(storedShortcut);
-      if (storedSettings) setAppSettings(storedSettings);
+      const [sp, ss, st] = await Promise.all([
+        invoke<any>("get_store_value", { key: "providers" }),
+        invoke<any>("get_store_value", { key: "shortcut" }),
+        invoke<any>("get_store_value", { key: "settings" }),
+      ]);
+      if (sp) setProviders(sp);
+      if (typeof ss === "string") setShortcut(ss);
+      if (st) setAppSettings((prev) => ({ ...prev, ...st }));
     } catch (err) {
       console.error("Failed to load settings:", err);
+    }
+  };
+
+  const checkPermissions = async () => {
+    // Check microphone via Web Permissions API
+    let micStatus: PermissionState["microphone"] = "unknown";
+    try {
+      if (navigator.permissions) {
+        const result = await navigator.permissions.query({ name: "microphone" as PermissionName });
+        micStatus = result.state as "granted" | "denied" | "prompt";
+      }
+    } catch {
+      micStatus = "unknown";
+    }
+
+    // Check accessibility via Rust (macOS only; always true on other platforms)
+    let accessibilityGranted = true;
+    try {
+      accessibilityGranted = await invoke<boolean>("check_accessibility_permission");
+    } catch {
+      accessibilityGranted = true;
+    }
+
+    setPermissions({ microphone: micStatus, accessibility: accessibilityGranted });
+  };
+
+  const openPermissionSettings = async (type: "microphone" | "accessibility") => {
+    try {
+      await invoke("open_permission_settings", { permissionType: type });
+      // Re-check after a short delay to pick up any changes
+      setTimeout(checkPermissions, 2000);
+    } catch (err) {
+      console.error("Failed to open permission settings:", err);
     }
   };
 
   const saveSettings = async () => {
     setShortcutError(null);
     try {
-      // Save providers and app settings
       await Promise.all([
         invoke("set_store_value", { key: "providers", value: providers }),
         invoke("set_store_value", { key: "settings", value: appSettings }),
+        invoke("update_shortcut", { shortcut: shortcut.trim() }),
       ]);
-
-      // Update shortcut (validates + re-registers in Rust)
-      await invoke("update_shortcut", { shortcut: shortcut.trim() });
-
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.toLowerCase().includes("shortcut") || msg.toLowerCase().includes("invalid")) {
         setShortcutError(msg);
-      } else {
-        console.error("Failed to save settings:", err);
+        setTab("general");
       }
     }
   };
 
-  const updateProvider = (
-    type: "stt" | "llm",
-    field: keyof ProviderConfig,
-    value: string | number
-  ) => {
-    setProviders((prev) => ({
-      ...prev,
-      [type]: { ...prev[type], [field]: value },
-    }));
+  const upd = (type: "stt" | "llm", field: keyof ProviderConfig, value: string) => {
+    setProviders((prev) => ({ ...prev, [type]: { ...prev[type], [field]: value } }));
   };
 
-  const silenceTimeoutSeconds = appSettings.silenceTimeoutMs / 1000;
+  const silenceSec = appSettings.silenceTimeoutMs / 1000;
+  const isMac = navigator.platform.includes("Mac");
+  const showPermissions = isMac && (permissions.microphone === "denied" || !permissions.accessibility);
 
   return (
     <motion.div
       initial={{ height: 0, opacity: 0 }}
       animate={{ height: "auto", opacity: 1 }}
       exit={{ height: 0, opacity: 0 }}
-      className="border-b border-white/10 bg-dark-900/50"
+      transition={{ duration: 0.2 }}
+      className="overflow-hidden border-b border-neutral-800"
     >
-      <div className="p-4 max-h-[400px] overflow-y-auto">
-        <h3 className="text-sm font-semibold text-white mb-4 flex items-center gap-2">
-          <Key className="w-4 h-4" />
-          Provider Configuration
-        </h3>
-
-        {/* Rephrasing Toggle */}
-        <div className="flex items-center justify-between mb-4 p-3 rounded-xl bg-white/5">
-          <div className="flex items-center gap-2">
-            <Brain className="w-4 h-4 text-purple-400" />
-            <span className="text-sm text-white">AI Rephrasing</span>
-          </div>
-          <button
-            onClick={() => setEnableRephrasing(!enableRephrasing)}
-            className={`w-12 h-6 rounded-full transition-colors relative ${
-              enableRephrasing ? "bg-purple-500" : "bg-white/20"
-            }`}
-          >
-            <div
-              className={`w-5 h-5 rounded-full bg-white absolute top-0.5 transition-transform ${
-                enableRephrasing ? "translate-x-6" : "translate-x-0.5"
+      <div className="bg-neutral-900 px-5 py-3">
+        {/* Tab bar + AI toggle */}
+        <div className="flex items-center gap-1 mb-3">
+          {(["providers", "general"] as Tab[]).map((t) => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                tab === t ? "bg-neutral-800 text-white" : "text-neutral-500 hover:text-neutral-300"
               }`}
-            />
-          </button>
-        </div>
-
-        {/* Global Shortcut */}
-        <div className="mb-4">
-          <h4 className="text-xs text-white/40 mb-2 flex items-center gap-1">
-            <Keyboard className="w-3 h-3" />
-            Global Shortcut
-          </h4>
-          <input
-            type="text"
-            value={shortcut}
-            onChange={(e) => {
-              setShortcut(e.target.value);
-              setShortcutError(null);
-            }}
-            placeholder="e.g. cmd+shift+v"
-            className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-          />
-          {shortcutError && (
-            <p className="text-xs text-red-400 mt-1">{shortcutError}</p>
-          )}
-          <p className="text-xs text-white/20 mt-1">
-            Use modifier keys: cmd, ctrl, shift, alt + key (e.g. cmd+shift+v)
-          </p>
-        </div>
-
-        {/* Silence Detection */}
-        <div className="mb-4">
-          <h4 className="text-xs text-white/40 mb-2 flex items-center gap-1">
-            <Timer className="w-3 h-3" />
-            Auto-stop after silence
-          </h4>
-          <div className="flex items-center gap-3">
-            <input
-              type="range"
-              min="0"
-              max="10"
-              step="0.5"
-              value={silenceTimeoutSeconds}
-              onChange={(e) =>
-                setAppSettings((prev) => ({
-                  ...prev,
-                  silenceTimeoutMs: parseFloat(e.target.value) * 1000,
-                }))
-              }
-              className="flex-1 accent-purple-500"
-            />
-            <span className="text-xs text-white/60 w-16 text-right">
-              {silenceTimeoutSeconds === 0
-                ? "Disabled"
-                : `${silenceTimeoutSeconds}s`}
-            </span>
+            >
+              {t === "providers" ? "Providers" : "General"}
+            </button>
+          ))}
+          <div className="flex-1" />
+          <div className="flex items-center gap-1.5">
+            <Zap className="w-3 h-3 text-indigo-400" />
+            <span className="text-xs text-neutral-500">AI</span>
+            <button
+              onClick={() => setEnableRephrasing(!enableRephrasing)}
+              className={`w-8 h-[18px] rounded-full transition-colors relative ${
+                enableRephrasing ? "bg-indigo-600" : "bg-neutral-700"
+              }`}
+            >
+              <div
+                className="w-3.5 h-3.5 rounded-full bg-white absolute transition-all duration-150"
+                style={{ top: "2px", left: enableRephrasing ? "16px" : "2px" }}
+              />
+            </button>
           </div>
         </div>
 
-        {/* STT Provider */}
-        <div className="mb-4">
-          <h4 className="text-xs text-white/40 mb-2 flex items-center gap-1">
-            <Mic className="w-3 h-3" />
-            Speech-to-Text Provider
-          </h4>
-          <div className="space-y-2">
-            <input
-              type="text"
-              value={providers.stt.base_url}
-              onChange={(e) => updateProvider("stt", "base_url", e.target.value)}
-              placeholder="Base URL (e.g., https://api.openai.com/v1)"
-              className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-            />
-            <input
-              type="password"
-              value={providers.stt.api_key}
-              onChange={(e) => updateProvider("stt", "api_key", e.target.value)}
-              placeholder="API Key"
-              className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-            />
-            <input
-              type="text"
-              value={providers.stt.model}
-              onChange={(e) => updateProvider("stt", "model", e.target.value)}
-              placeholder="Model (e.g., whisper-1)"
-              className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-            />
-          </div>
-        </div>
+        {/* ── PROVIDERS TAB ── */}
+        {tab === "providers" && (
+          <div className="space-y-4">
+            {/* STT Mode Toggle */}
+            <div>
+              <p className="text-[11px] text-neutral-500 uppercase tracking-wider flex items-center gap-1.5 mb-2">
+                <Mic className="w-3 h-3" /> Speech-to-Text Mode
+              </p>
+              <div className="flex rounded-md overflow-hidden border border-neutral-700">
+                <button
+                  onClick={() => setAppSettings((p) => ({ ...p, sttMode: "local" }))}
+                  className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    appSettings.sttMode === "local"
+                      ? "bg-indigo-600 text-white"
+                      : "text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800"
+                  }`}
+                >
+                  <Cpu className="w-3 h-3" />
+                  Local (offline)
+                </button>
+                <div className="w-px bg-neutral-700" />
+                <button
+                  onClick={() => setAppSettings((p) => ({ ...p, sttMode: "api" }))}
+                  className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
+                    appSettings.sttMode === "api"
+                      ? "bg-indigo-600 text-white"
+                      : "text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800"
+                  }`}
+                >
+                  <Zap className="w-3 h-3" />
+                  API (cloud)
+                </button>
+              </div>
+            </div>
 
-        {/* LLM Provider */}
-        <div className="mb-4">
-          <h4 className="text-xs text-white/40 mb-2 flex items-center gap-1">
-            <Brain className="w-3 h-3" />
-            LLM Provider (Rephrasing)
-          </h4>
-          <div className="space-y-2">
-            <input
-              type="text"
-              value={providers.llm.base_url}
-              onChange={(e) => updateProvider("llm", "base_url", e.target.value)}
-              placeholder="Base URL (e.g., https://api.openai.com/v1)"
-              className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-            />
-            <input
-              type="password"
-              value={providers.llm.api_key}
-              onChange={(e) => updateProvider("llm", "api_key", e.target.value)}
-              placeholder="API Key"
-              className="w-full px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-            />
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={providers.llm.model}
-                onChange={(e) => updateProvider("llm", "model", e.target.value)}
-                placeholder="Model (e.g., gpt-4o-mini)"
-                className="flex-1 px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-              />
-              <input
-                type="number"
-                min="0"
-                max="1"
-                step="0.1"
-                value={providers.llm.temperature}
-                onChange={(e) =>
-                  updateProvider("llm", "temperature", parseFloat(e.target.value))
-                }
-                placeholder="Temp"
-                className="w-20 px-3 py-2 rounded-lg bg-dark-900/80 border border-white/10 text-sm text-white placeholder-white/20 focus:outline-none focus:border-white/30"
-              />
+            {/* Local model selector */}
+            {appSettings.sttMode === "local" && (
+              <div className="pl-0">
+                <ModelManager
+                  selectedModel={appSettings.localModel || "base"}
+                  onSelectModel={(id) => setAppSettings((p) => ({ ...p, localModel: id }))}
+                />
+              </div>
+            )}
+
+            {/* Cloud STT provider fields */}
+            {appSettings.sttMode === "api" && (
+              <div className="space-y-1.5">
+                <Field label="URL" value={providers.stt.base_url} onChange={(v) => upd("stt", "base_url", v)} placeholder="https://api.openai.com/v1" />
+                <Field label="Key" type="password" value={providers.stt.api_key} onChange={(v) => upd("stt", "api_key", v)} placeholder="sk-..." />
+                <Field label="Model" value={providers.stt.model} onChange={(v) => upd("stt", "model", v)} placeholder="whisper-1" mono />
+              </div>
+            )}
+
+            <div className="h-px bg-neutral-800" />
+
+            {/* LLM Rephrasing */}
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-neutral-500 uppercase tracking-wider flex items-center gap-1.5 mb-2">
+                <Brain className="w-3 h-3" /> LLM Rephrasing
+              </p>
+              <Field label="URL" value={providers.llm.base_url} onChange={(v) => upd("llm", "base_url", v)} placeholder="https://api.openai.com/v1" />
+              <Field label="Key" type="password" value={providers.llm.api_key} onChange={(v) => upd("llm", "api_key", v)} placeholder="sk-..." />
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-neutral-500 w-14 shrink-0 text-right">Model</span>
+                <input type="text" value={providers.llm.model} onChange={(e) => upd("llm", "model", e.target.value)} placeholder="gpt-4o-mini"
+                  className="flex-1 px-2.5 py-1.5 rounded-md bg-neutral-800 border border-neutral-700 text-xs text-white font-mono
+                             placeholder-neutral-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-all" />
+                <input type="number" min="0" max="1" step="0.1" value={providers.llm.temperature ?? 0.3}
+                  onChange={(e) => setProviders((p) => ({ ...p, llm: { ...p.llm, temperature: parseFloat(e.target.value) } }))}
+                  className="w-14 px-2 py-1.5 rounded-md bg-neutral-800 border border-neutral-700 text-xs text-white text-center
+                             focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-all" />
+              </div>
+              <p className="text-[10px] text-neutral-600 pl-[4.75rem]">
+                Works with OpenAI, Ollama (localhost:11434), LM Studio, or any OpenAI-compatible endpoint
+              </p>
             </div>
           </div>
-        </div>
+        )}
 
-        {/* Actions */}
-        <div className="flex items-center justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 rounded-lg text-white/60 hover:text-white text-sm transition-colors"
-          >
-            Close
-          </button>
-          <button
-            onClick={saveSettings}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm transition-all ${
-              saved
-                ? "bg-green-500/20 text-green-400"
-                : "bg-white/10 hover:bg-white/20 text-white"
-            }`}
-          >
-            {saved ? (
-              <>
-                <Check className="w-3.5 h-3.5" />
-                Saved
-              </>
-            ) : (
-              <>
-                <Save className="w-3.5 h-3.5" />
-                Save
-              </>
+        {/* ── GENERAL TAB ── */}
+        {tab === "general" && (
+          <div className="space-y-4">
+            {/* Shortcut */}
+            <div>
+              <p className="text-[11px] text-neutral-500 uppercase tracking-wider flex items-center gap-1.5 mb-2">
+                <Keyboard className="w-3 h-3" /> Shortcut
+              </p>
+              <input
+                type="text" value={shortcut}
+                onChange={(e) => { setShortcut(e.target.value); setShortcutError(null); }}
+                placeholder="cmd+shift+v"
+                className={`w-full px-2.5 py-1.5 rounded-md bg-neutral-800 border text-xs text-white font-mono
+                            placeholder-neutral-600 focus:outline-none transition-all duration-150
+                            ${shortcutError ? "border-red-500 focus:ring-1 focus:ring-red-500/30" : "border-neutral-700 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20"}`}
+              />
+              {shortcutError
+                ? <p className="text-[11px] text-red-400 mt-1">{shortcutError}</p>
+                : <p className="text-[11px] text-neutral-600 mt-1">cmd / ctrl / shift / alt + key</p>}
+            </div>
+
+            {/* Silence auto-stop */}
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-[11px] text-neutral-500 uppercase tracking-wider flex items-center gap-1.5">
+                  <Timer className="w-3 h-3" /> Silence auto-stop
+                </p>
+                <span className="text-xs text-neutral-400 font-mono tabular-nums">
+                  {silenceSec === 0 ? "off" : `${silenceSec}s`}
+                </span>
+              </div>
+              <input type="range" min="0" max="10" step="0.5" value={silenceSec}
+                onChange={(e) => setAppSettings((p) => ({ ...p, silenceTimeoutMs: parseFloat(e.target.value) * 1000 }))}
+                className="w-full accent-indigo-500 cursor-pointer" />
+              <div className="flex justify-between text-[10px] text-neutral-700 mt-0.5">
+                <span>off</span><span>5s</span><span>10s</span>
+              </div>
+            </div>
+
+            {/* Permissions section — only shown on macOS when there's an issue */}
+            {showPermissions && (
+              <div>
+                <p className="text-[11px] text-neutral-500 uppercase tracking-wider flex items-center gap-1.5 mb-2">
+                  <ShieldAlert className="w-3 h-3 text-amber-400" /> Permissions
+                </p>
+                <div className="space-y-1.5">
+                  {permissions.microphone === "denied" && (
+                    <PermissionRow
+                      label="Microphone"
+                      status="denied"
+                      description="Required for voice recording"
+                      onFix={() => openPermissionSettings("microphone")}
+                    />
+                  )}
+                  {!permissions.accessibility && (
+                    <PermissionRow
+                      label="Accessibility"
+                      status="denied"
+                      description="Required for text injection (paste)"
+                      onFix={() => openPermissionSettings("accessibility")}
+                    />
+                  )}
+                </div>
+              </div>
             )}
-          </button>
-        </div>
 
-        <p className="text-xs text-white/30 mt-3">
-          Supports any OpenAI-compatible API (OpenAI, Groq, Ollama, etc.)
-        </p>
+            {/* All good indicator */}
+            {isMac && !showPermissions && permissions.microphone !== "unknown" && (
+              <div className="flex items-center gap-2 text-[11px] text-emerald-500">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                All permissions granted
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Footer */}
+        <div className="flex items-center justify-between mt-3 pt-3 border-t border-neutral-800">
+          <span className="text-[11px] text-neutral-600">
+            {appSettings.sttMode === "local" ? "whisper.cpp local" : "OpenAI-compatible"}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={onClose}
+              className="px-2.5 py-1 rounded-md text-xs text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-all"
+            >
+              Close
+            </button>
+            <button
+              onClick={saveSettings}
+              className={`flex items-center gap-1 px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                saved
+                  ? "bg-emerald-600/20 text-emerald-400 border border-emerald-600/30"
+                  : "bg-indigo-600 hover:bg-indigo-500 text-white"
+              }`}
+            >
+              {saved ? <><Check className="w-3 h-3" /> Saved</> : <><Save className="w-3 h-3" /> Save</>}
+            </button>
+          </div>
+        </div>
       </div>
     </motion.div>
+  );
+}
+
+function PermissionRow({
+  label, status, description, onFix,
+}: {
+  label: string; status: "granted" | "denied"; description: string; onFix: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between px-2.5 py-2 rounded-md bg-neutral-800 border border-neutral-700">
+      <div>
+        <div className="flex items-center gap-1.5">
+          {status === "granted"
+            ? <ShieldCheck className="w-3 h-3 text-emerald-500" />
+            : <ShieldAlert className="w-3 h-3 text-amber-400" />}
+          <span className="text-xs text-white">{label}</span>
+        </div>
+        <p className="text-[10px] text-neutral-500 mt-0.5 ml-[18px]">{description}</p>
+      </div>
+      {status === "denied" && (
+        <button
+          onClick={onFix}
+          className="ml-3 px-2 py-1 rounded-md bg-amber-500/10 border border-amber-500/20
+                     text-[10px] text-amber-400 hover:bg-amber-500/20 transition-colors shrink-0"
+        >
+          Open Settings
+        </button>
+      )}
+    </div>
   );
 }

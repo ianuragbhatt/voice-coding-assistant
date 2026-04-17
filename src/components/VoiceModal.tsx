@@ -1,25 +1,25 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
-import {
-  Mic,
-  Square,
-  Send,
-  RefreshCw,
-  Settings,
-  X,
-  Loader2,
-  Sparkles,
-} from "lucide-react";
+import { Settings, RefreshCw, Send, ShieldAlert } from "lucide-react";
 import AudioVisualizer from "./AudioVisualizer";
+import SiriWave from "./SiriWave";
 import SettingsPanel from "./SettingsPanel";
 import { useAudioRecorder } from "../hooks/useAudioRecorder";
 import { useSpeechToText } from "../hooks/useSpeechToText";
 import { useLLMRephraser } from "../hooks/useLLMRephraser";
+import { useLocalTranscription } from "../hooks/useLocalTranscription";
 
 type AppState = "idle" | "recording" | "transcribing" | "rephrasing" | "preview";
+
+const WIN_W = 480;
+const HEIGHT: Record<string, number> = {
+  compact:  118,
+  preview:  240,
+  settings: 390,
+};
 
 export default function VoiceModal() {
   const [appState, setAppState] = useState<AppState>("idle");
@@ -29,27 +29,46 @@ export default function VoiceModal() {
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [enableRephrasing, setEnableRephrasing] = useState(true);
+  // Accessibility warning (macOS only — shown in idle bar)
+  const [accessibilityMissing, setAccessibilityMissing] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const {
-    isRecording,
-    audioBlob,
-    error: recorderError,
-    startRecording,
-    stopRecording,
-    resetRecorder,
+    isRecording, audioBlob, error: recorderError,
+    startRecording, stopRecording, resetRecorder,
   } = useAudioRecorder();
 
   const { transcribe, error: sttError } = useSpeechToText();
   const { rephrase, error: llmError } = useLLMRephraser();
+  const { transcribe: localTranscribe, error: localSttError } = useLocalTranscription();
+
+  // Check accessibility permission on mount (macOS only)
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const granted = await invoke<boolean>("check_accessibility_permission");
+        setAccessibilityMissing(!granted);
+      } catch {
+        setAccessibilityMissing(false);
+      }
+    };
+    check();
+  }, []);
+
+  const resizeWindow = useCallback(async (mode: keyof typeof HEIGHT) => {
+    const win = getCurrentWindow();
+    await win.setSize(new LogicalSize(WIN_W, HEIGHT[mode]));
+  }, []);
 
   const hideWindow = useCallback(async () => {
-    const window = getCurrentWindow();
-    await window.hide();
+    const win = getCurrentWindow();
+    await win.hide();
     setAppState("idle");
+    setShowSettings(false);
     resetRecorder();
-  }, [resetRecorder]);
+    await resizeWindow("compact");
+  }, [resetRecorder, resizeWindow]);
 
   const handleStartRecording = useCallback(async () => {
     resetRecorder();
@@ -57,8 +76,10 @@ export default function VoiceModal() {
     setRephrasedText("");
     setEditedText("");
     setError(null);
+    setShowSettings(false);
+    await resizeWindow("compact");
     await startRecording();
-  }, [resetRecorder, startRecording]);
+  }, [resetRecorder, startRecording, resizeWindow]);
 
   const handleStopRecording = useCallback(async () => {
     await stopRecording();
@@ -69,11 +90,32 @@ export default function VoiceModal() {
   }, [hideWindow]);
 
   const handleSend = useCallback(async () => {
+    const textToSend = editedText;
+
+    // On macOS, check accessibility permission BEFORE hiding the window.
+    // Without it, enigo can't simulate Cmd+V and the text is lost silently.
+    const isMacOS = navigator.platform.includes("Mac");
+    if (isMacOS) {
+      try {
+        const granted = await invoke<boolean>("check_accessibility_permission");
+        if (!granted) {
+          setError(
+            "Accessibility permission required to inject text. " +
+            "Open System Settings → Privacy & Security → Accessibility → add this app, then try again."
+          );
+          setAccessibilityMissing(true);
+          return; // keep modal open so user can see the error
+        }
+      } catch {
+        // If the check itself fails, proceed anyway
+      }
+    }
+
+    await hideWindow();
     try {
-      await invoke("type_text", { text: editedText });
-      await hideWindow();
+      await invoke("type_text", { text: textToSend });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to type text");
+      console.error("Failed to type text:", err);
     }
   }, [editedText, hideWindow]);
 
@@ -81,7 +123,17 @@ export default function VoiceModal() {
     try {
       setAppState("transcribing");
 
-      const text = await transcribe(blob);
+      // Read current STT mode and local model from store
+      const settings = await invoke<any>("get_store_value", { key: "settings" });
+      const sttMode: string = settings?.sttMode ?? "api";
+      const localModel: string = settings?.localModel ?? "base";
+
+      let text: string;
+      if (sttMode === "local") {
+        text = await localTranscribe(blob, localModel);
+      } else {
+        text = await transcribe(blob);
+      }
       setTranscribedText(text);
 
       if (enableRephrasing) {
@@ -94,333 +146,308 @@ export default function VoiceModal() {
         setEditedText(text);
       }
 
+      await resizeWindow("preview");
       setAppState("preview");
-
-      setTimeout(() => {
-        textareaRef.current?.focus();
-      }, 100);
+      setTimeout(() => textareaRef.current?.focus(), 100);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to process audio");
       setAppState("idle");
     }
-  }, [transcribe, rephrase, enableRephrasing]);
+  }, [transcribe, localTranscribe, rephrase, enableRephrasing, resizeWindow]);
 
-  // Listen for toggle events from Rust
   useEffect(() => {
     const unlisten = listen<boolean>("voice:toggle", (event) => {
-      if (event.payload) {
-        handleStartRecording();
-      } else {
-        handleStopRecording();
-      }
+      if (event.payload) handleStartRecording();
+      else handleStopRecording();
     });
-
-    return () => {
-      unlisten.then((f) => f());
-    };
+    return () => { unlisten.then((f) => f()); };
   }, [handleStartRecording, handleStopRecording]);
 
-  // Listen for open-settings event from tray menu
   useEffect(() => {
     const unlisten = listen("voice:open-settings", () => {
       setShowSettings(true);
+      resizeWindow("settings");
     });
+    return () => { unlisten.then((f) => f()); };
+  }, [resizeWindow]);
 
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, []);
-
-  // Handle recording state changes
   useEffect(() => {
-    if (isRecording) {
-      setAppState("recording");
-      setError(null);
-    }
+    if (isRecording) { setAppState("recording"); setError(null); }
   }, [isRecording]);
 
-  // Process audio when recording stops
   useEffect(() => {
-    if (audioBlob && !isRecording) {
-      processAudio(audioBlob);
-    }
+    if (audioBlob && !isRecording) processAudio(audioBlob);
   }, [audioBlob, isRecording, processAudio]);
 
-  // Handle errors
   useEffect(() => {
-    const err = recorderError || sttError || llmError;
-    if (err) {
-      setError(err);
-    }
-  }, [recorderError, sttError, llmError]);
+    const err = recorderError || sttError || llmError || localSttError;
+    if (err) setError(err);
+  }, [recorderError, sttError, llmError, localSttError]);
 
-  // Keyboard shortcuts in preview mode
   useEffect(() => {
     if (appState !== "preview") return;
-
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-        e.preventDefault();
-        handleSend();
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        handleCancel();
-      }
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); handleSend(); }
+      else if (e.key === "Escape") { e.preventDefault(); handleCancel(); }
     };
-
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [appState, handleSend, handleCancel]);
 
-  const toggleRecording = () => {
-    if (isRecording) {
-      handleStopRecording();
-    } else {
-      handleStartRecording();
-    }
-  };
-
   const isMac = navigator.platform.includes("Mac");
+  const isProcessing = appState === "transcribing" || appState === "rephrasing";
+
+  const toggleSettings = useCallback(() => {
+    const next = !showSettings;
+    setShowSettings(next);
+    if (next) resizeWindow("settings");
+    else {
+      if (appState === "preview") resizeWindow("preview");
+      else resizeWindow("compact");
+    }
+  }, [showSettings, appState, resizeWindow]);
 
   return (
-    <div className="w-full h-screen bg-transparent flex items-center justify-center p-4">
-      <motion.div
-        initial={{ opacity: 0, scale: 0.9, y: 20 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.9, y: 20 }}
-        className="glass-panel w-full max-w-lg overflow-hidden"
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
-              <Sparkles className="w-4 h-4 text-white" />
-            </div>
-            <span className="font-semibold text-white">Voice Assistant</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setShowSettings(!showSettings)}
-              className="p-2 rounded-lg hover:bg-white/10 transition-colors text-white/60 hover:text-white"
+    <div className="w-full h-screen bg-transparent flex flex-col">
+      <div className="w-full h-full bg-[#1c1c1e] rounded-xl flex flex-col overflow-hidden">
+        <AnimatePresence mode="wait">
+          {showSettings ? (
+            <motion.div
+              key="settings"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              transition={{ duration: 0.12 }}
+              className="flex flex-col h-full overflow-hidden"
             >
-              <Settings className="w-5 h-5" />
-            </button>
-            <button
-              onClick={handleCancel}
-              className="p-2 rounded-lg hover:bg-white/10 transition-colors text-white/60 hover:text-white"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
-
-        {/* Settings Panel */}
-        <AnimatePresence>
-          {showSettings && (
-            <SettingsPanel
-              enableRephrasing={enableRephrasing}
-              setEnableRephrasing={setEnableRephrasing}
-              onClose={() => setShowSettings(false)}
-            />
-          )}
-        </AnimatePresence>
-
-        {/* Main Content */}
-        <div className="p-6">
-          <AnimatePresence mode="wait">
-            {/* Recording State */}
-            {appState === "recording" && (
-              <motion.div
-                key="recording"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex flex-col items-center py-8"
+              <div
+                data-tauri-drag-region
+                className="flex items-center justify-between px-4 py-2.5 border-b border-white/[0.06] select-none shrink-0"
               >
-                <div className="relative mb-8">
-                  <div className="w-24 h-24 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shadow-lg shadow-blue-500/25">
-                    <Mic className="w-10 h-10 text-white" />
-                  </div>
-                  <div className="absolute inset-0 rounded-full bg-blue-500/30 pulse-ring" />
-                  <div
-                    className="absolute inset-0 rounded-full bg-blue-500/20 pulse-ring"
-                    style={{ animationDelay: "0.5s" }}
-                  />
-                </div>
-
-                <AudioVisualizer isRecording={isRecording} />
-
-                <p className="text-white/60 mt-6 mb-4">Listening...</p>
-
+                <span className="text-[11px] font-medium text-white/40 pointer-events-none">Settings</span>
                 <button
-                  onClick={toggleRecording}
-                  className="glass-button flex items-center gap-2 text-white"
+                  onClick={toggleSettings}
+                  className="text-[11px] text-white/40 hover:text-white/70 transition-colors px-2 py-0.5 rounded"
                 >
-                  <Square className="w-4 h-4 fill-current" />
-                  Stop Recording
+                  Done
                 </button>
-              </motion.div>
-            )}
-
-            {/* Transcribing State */}
-            {appState === "transcribing" && (
-              <motion.div
-                key="transcribing"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex flex-col items-center py-12"
-              >
-                <Loader2 className="w-12 h-12 text-blue-400 animate-spin-slow mb-4" />
-                <p className="text-white/60">Transcribing audio...</p>
-              </motion.div>
-            )}
-
-            {/* Rephrasing State */}
-            {appState === "rephrasing" && (
-              <motion.div
-                key="rephrasing"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex flex-col items-center py-12"
-              >
-                <Sparkles className="w-12 h-12 text-purple-400 animate-pulse mb-4" />
-                <p className="text-white/60">Optimizing for coding agents...</p>
-              </motion.div>
-            )}
-
-            {/* Preview State */}
-            {appState === "preview" && (
-              <motion.div
-                key="preview"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex flex-col"
-              >
-                {/* Original Text */}
-                {enableRephrasing && transcribedText !== rephrasedText && (
-                  <div className="mb-4 p-3 rounded-xl bg-white/5 border border-white/10">
-                    <p className="text-xs text-white/40 mb-1">Original:</p>
-                    <p className="text-sm text-white/60 italic">
-                      "{transcribedText}"
-                    </p>
-                  </div>
+              </div>
+              <div className="flex-1 overflow-y-auto">
+                <SettingsPanel
+                  enableRephrasing={enableRephrasing}
+                  setEnableRephrasing={setEnableRephrasing}
+                  onClose={toggleSettings}
+                />
+              </div>
+            </motion.div>
+          ) : (
+            <motion.div
+              key="main"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              transition={{ duration: 0.12 }}
+              className="flex flex-col h-full"
+            >
+              {/* Original text chip (only when rephrasing changed text) */}
+              <AnimatePresence>
+                {appState === "preview" && enableRephrasing && transcribedText && transcribedText !== rephrasedText && (
+                  <motion.div
+                    key="original-chip"
+                    initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+                    className="px-4 pt-3 shrink-0"
+                  >
+                    <div className="px-2.5 py-1.5 rounded-lg bg-white/[0.05] border border-white/[0.06]">
+                      <p className="text-[10px] text-white/30 mb-0.5">Original</p>
+                      <p className="text-[11px] text-white/45 italic leading-snug">"{transcribedText}"</p>
+                    </div>
+                  </motion.div>
                 )}
+              </AnimatePresence>
 
-                {/* Editable Text */}
-                <div className="mb-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs text-white/40">
-                      {enableRephrasing
-                        ? "Optimized for coding agents:"
-                        : "Transcribed text:"}
-                    </span>
-                    <span className="text-xs text-white/30">
-                      {editedText.length} chars
-                    </span>
-                  </div>
-                  <textarea
-                    ref={textareaRef}
-                    value={editedText}
-                    onChange={(e) => setEditedText(e.target.value)}
-                    className="glass-input h-32 font-mono text-sm"
-                    placeholder="Text will appear here..."
+              {/* Main visualizer / content area */}
+              <div data-tauri-drag-region className="flex-1 flex items-center px-3 min-h-0">
+                <AnimatePresence mode="wait">
+                  {appState === "recording" && (
+                    <motion.div key="rec" className="w-full h-[72px]"
+                      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
+                      <AudioVisualizer isRecording={true} />
+                    </motion.div>
+                  )}
+                  {isProcessing && (
+                    <motion.div key="proc" className="w-full h-[72px]"
+                      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.2 }}>
+                      <SiriWave active />
+                    </motion.div>
+                  )}
+                  {appState === "preview" && (
+                    <motion.div key="preview" className="w-full"
+                      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
+                      <div className="flex items-center justify-between mb-1 px-1">
+                        <span className="text-[10px] text-white/30">
+                          {enableRephrasing ? "Optimized" : "Transcribed"}
+                        </span>
+                        <span className="text-[10px] text-white/20">{editedText.length} chars</span>
+                      </div>
+                      <textarea
+                        ref={textareaRef}
+                        value={editedText}
+                        onChange={(e) => setEditedText(e.target.value)}
+                        className="w-full h-[108px] px-2.5 py-2 rounded-lg bg-white/[0.06] border border-white/[0.08]
+                                   text-[12px] text-white/90 placeholder-white/20 font-mono leading-relaxed
+                                   focus:outline-none focus:border-white/20 focus:ring-0
+                                   resize-none transition-colors duration-150"
+                        placeholder="Transcribed text will appear here…"
+                      />
+                    </motion.div>
+                  )}
+                  {appState === "idle" && (
+                    <motion.div key="idle" className="w-full h-[72px]"
+                      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }}>
+                      <SiriWave active={false} />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Error strip */}
+              <AnimatePresence>
+                {error && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }}
+                    className="px-3 pb-1 shrink-0"
+                  >
+                    <div className="px-2.5 py-1.5 rounded-lg bg-red-900/30 border border-red-800/40 text-red-400 text-[11px] leading-snug">
+                      {accessibilityMissing && error.includes("Accessibility") ? (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex-1">Accessibility permission needed to inject text.</span>
+                          <button
+                            onClick={async () => {
+                              await invoke("open_permission_settings", { permissionType: "accessibility" });
+                              // Re-check after user returns to the app
+                              setTimeout(async () => {
+                                const granted = await invoke<boolean>("check_accessibility_permission").catch(() => false);
+                                setAccessibilityMissing(!granted);
+                                if (granted) setError(null);
+                              }, 2000);
+                            }}
+                            className="shrink-0 px-2 py-0.5 rounded bg-red-500/20 border border-red-500/30
+                                       text-[10px] text-red-300 hover:bg-red-500/30 transition-colors whitespace-nowrap"
+                          >
+                            Open Settings
+                          </button>
+                        </div>
+                      ) : (
+                        error
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Bottom action bar */}
+              <div className="flex items-center justify-between px-3.5 py-2.5 border-t border-white/[0.06] shrink-0">
+                {/* Left — status + accessibility warning */}
+                <div className="flex items-center gap-2">
+                  <div
+                    className={`w-[7px] h-[7px] rounded-full transition-colors duration-300 ${
+                      isRecording
+                        ? "bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.8)] animate-pulse"
+                        : isProcessing ? "bg-amber-400/70" : "bg-white/15"
+                    }`}
                   />
+                  <span className="text-[11px] text-white/35 select-none">
+                    {isRecording ? "Recording" : isProcessing ? "Voice processing" : appState === "preview" ? "Ready" : "Voice Coding"}
+                  </span>
+                  {/* Accessibility warning badge (macOS only) */}
+                  {accessibilityMissing && appState === "idle" && (
+                    <button
+                      onClick={toggleSettings}
+                      className="flex items-center gap-0.5 text-[10px] text-amber-400/70 hover:text-amber-400 transition-colors"
+                      title="Accessibility permission required for text injection"
+                    >
+                      <ShieldAlert className="w-2.5 h-2.5" />
+                    </button>
+                  )}
                 </div>
 
-                {/* Actions */}
-                <div className="flex items-center justify-between">
-                  <button
-                    onClick={() => handleStartRecording()}
-                    className="glass-button flex items-center gap-2 text-white/70 hover:text-white"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    Retry
-                  </button>
-
-                  <div className="flex items-center gap-2">
+                {/* Right — action buttons */}
+                <div className="flex items-center gap-1.5">
+                  {appState === "recording" && (
+                    <>
+                      <button
+                        onClick={handleStopRecording}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium text-white/70
+                                   hover:text-white hover:bg-white/10 transition-colors"
+                      >
+                        Stop <Kbd>{isMac ? "⌘" : "Ctrl"}↑</Kbd>
+                      </button>
+                      <button
+                        onClick={handleCancel}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] text-white/40
+                                   hover:text-white/70 hover:bg-white/[0.06] transition-colors"
+                      >
+                        Cancel <Kbd>esc</Kbd>
+                      </button>
+                    </>
+                  )}
+                  {isProcessing && (
                     <button
                       onClick={handleCancel}
-                      className="px-4 py-2 rounded-xl text-white/60 hover:text-white transition-colors flex items-center gap-1.5"
+                      className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] text-white/40
+                                 hover:text-white/70 hover:bg-white/[0.06] transition-colors"
                     >
-                      Cancel
-                      <kbd className="text-xs px-1.5 py-0.5 rounded bg-white/10 text-white/40">Esc</kbd>
+                      Cancel <Kbd>esc</Kbd>
                     </button>
+                  )}
+                  {appState === "preview" && (
+                    <>
+                      <button
+                        onClick={() => handleStartRecording()}
+                        className="px-2.5 py-1 rounded-md text-[11px] text-white/40 hover:text-white/70
+                                   hover:bg-white/[0.06] transition-colors"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                      </button>
+                      <button
+                        onClick={handleCancel}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] text-white/40
+                                   hover:text-white/70 hover:bg-white/[0.06] transition-colors"
+                      >
+                        Cancel <Kbd>esc</Kbd>
+                      </button>
+                      <button
+                        onClick={handleSend}
+                        disabled={!editedText.trim()}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-medium
+                                   bg-white/10 text-white/80 hover:bg-white/[0.16] hover:text-white
+                                   disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <Send className="w-3 h-3" />
+                        Send <Kbd>{isMac ? "⌘" : "Ctrl"}↵</Kbd>
+                      </button>
+                    </>
+                  )}
+                  {(appState === "idle" || appState === "recording" || appState === "preview") && (
                     <button
-                      onClick={handleSend}
-                      disabled={!editedText.trim()}
-                      className="glass-button flex items-center gap-2 bg-gradient-to-r from-blue-500 to-purple-600 border-0 hover:opacity-90 disabled:opacity-50"
+                      onClick={toggleSettings}
+                      className="ml-0.5 p-1.5 rounded-md text-white/25 hover:text-white/60
+                                 hover:bg-white/[0.06] transition-colors"
+                      title="Settings"
                     >
-                      <Send className="w-4 h-4" />
-                      Send
-                      <kbd className="text-xs px-1.5 py-0.5 rounded bg-white/20 text-white/70">
-                        {isMac ? "⌘" : "Ctrl"}↵
-                      </kbd>
+                      <Settings className="w-3 h-3" />
                     </button>
-                  </div>
+                  )}
                 </div>
-              </motion.div>
-            )}
-
-            {/* Idle State */}
-            {appState === "idle" && (
-              <motion.div
-                key="idle"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="flex flex-col items-center py-12"
-              >
-                <div className="w-20 h-20 rounded-full bg-white/5 flex items-center justify-center mb-4">
-                  <Mic className="w-8 h-8 text-white/30" />
-                </div>
-                <p className="text-white/40 text-center">
-                  Press{" "}
-                  <kbd className="px-2 py-1 rounded bg-white/10 text-white/60 text-sm">
-                    {isMac ? "Cmd+Shift+V" : "Ctrl+Shift+V"}
-                  </kbd>{" "}
-                  to start
-                </p>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          {/* Error Message */}
-          {error && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="mt-4 p-3 rounded-xl bg-red-500/20 border border-red-500/30 text-red-300 text-sm"
-            >
-              {error}
+              </div>
             </motion.div>
           )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-6 py-3 border-t border-white/10 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div
-              className={`w-2 h-2 rounded-full ${
-                isRecording ? "bg-red-500 animate-pulse" : "bg-white/20"
-              }`}
-            />
-            <span className="text-xs text-white/40">
-              {isRecording ? "Recording" : "Ready"}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            {enableRephrasing && (
-              <span className="text-xs text-purple-400 flex items-center gap-1">
-                <Sparkles className="w-3 h-3" />
-                AI Rephrasing On
-              </span>
-            )}
-          </div>
-        </div>
-      </motion.div>
+        </AnimatePresence>
+      </div>
     </div>
+  );
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="text-[9px] px-1 py-0.5 rounded bg-white/10 text-white/35 border border-white/[0.08] font-normal leading-none">
+      {children}
+    </span>
   );
 }
