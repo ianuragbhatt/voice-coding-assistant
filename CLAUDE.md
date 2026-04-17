@@ -1,170 +1,212 @@
-# CLAUDE.md — Voice Coding Assistant
+# Voice Coding Assistant
 
-## Project Structure
+A cross-platform desktop app (Tauri v2 · React · Rust) that records your voice, transcribes it locally or via cloud API, optionally improves the phrasing with an LLM, then injects the result into whatever app you're typing in.
 
-Tauri v2 desktop app (React + Rust) at the repository root.
+---
+
+## Project layout
 
 ```
 mac_voice_tool/
-├── src/                        ← React frontend
+├── src/                            React frontend
 │   ├── components/
-│   │   ├── VoiceModal.tsx      ← Main UI state machine
-│   │   ├── SettingsPanel.tsx   ← Settings UI (providers, model, permissions)
-│   │   ├── ModelManager.tsx    ← Whisper model download/selection UI
-│   │   ├── AudioVisualizer.tsx ← Frequency-bar waveform (recording state)
-│   │   └── SiriWave.tsx        ← Sine-wave animation (idle/processing states)
+│   │   ├── VoiceModal.tsx          Main UI — state machine + all user interactions
+│   │   ├── SettingsPanel.tsx       Settings UI (STT mode, providers, permissions)
+│   │   ├── ModelManager.tsx        Whisper model download / selection per platform
+│   │   ├── AudioVisualizer.tsx     Frequency-bar waveform shown while recording
+│   │   └── SiriWave.tsx            Sine-wave animation (idle / processing states)
 │   ├── hooks/
-│   │   ├── useAudioRecorder.ts     ← Mic capture → PCM WAV via ScriptProcessorNode
-│   │   ├── useLocalTranscription.ts← Local whisper.cpp inference via Tauri IPC
-│   │   ├── useSpeechToText.ts      ← Cloud STT via OpenAI-compatible API
-│   │   └── useLLMRephraser.ts      ← LLM text optimization (OpenAI-compatible)
-│   └── test/                   ← Vitest test suite
+│   │   ├── useAudioRecorder.ts     Mic → PCM 16 kHz → WAV blob (ScriptProcessorNode)
+│   │   ├── useLocalTranscription.ts  Sends WAV to Rust → whisper.cpp inference
+│   │   ├── useSpeechToText.ts      Sends WAV to OpenAI-compatible cloud STT API
+│   │   └── useLLMRephraser.ts      Sends transcript to OpenAI-compatible LLM
+│   └── test/                       Vitest test suite (30 tests)
 ├── src-tauri/
 │   ├── src/
-│   │   ├── main.rs             ← App setup, tray, shortcut registration
-│   │   └── commands.rs         ← All Tauri commands + WhisperState cache
+│   │   ├── main.rs                 App init, tray, shortcut, settings defaults
+│   │   └── commands.rs             All Tauri commands + WhisperState cache
 │   ├── Cargo.toml
 │   ├── tauri.conf.json
-│   ├── Entitlements.plist      ← macOS: audio-input + network entitlements
-│   └── Info.plist              ← macOS: NSMicrophoneUsageDescription etc.
+│   ├── Entitlements.plist          macOS: audio-input + network entitlements
+│   └── Info.plist                  macOS: NSMicrophoneUsageDescription etc.
+├── CLAUDE.md                       ← you are here
 ├── package.json
 └── vite.config.ts
 ```
 
-## Build Commands
+---
+
+## Build & run
 
 ```bash
-# Dev mode (hot-reload frontend + Rust auto-recompile)
+# Dev (hot-reload frontend + Rust auto-recompile)
 npm run tauri:dev
 
-# TypeScript type check
+# Type-check TypeScript
 npx tsc --noEmit
 
-# Rust compile check
+# Compile-check Rust
 cd src-tauri && cargo check
 
 # Run all tests
-npm test                        # Vitest (25 frontend tests)
-cd src-tauri && cargo test      # Rust unit tests (6 tests)
+npm test                        # Vitest — 30 frontend tests
+cd src-tauri && cargo test      # Rust unit tests — 6 tests
 
 # Production build
 npm run tauri:build
 ```
 
-All npm commands from repo root. All `cargo` commands from `src-tauri/`.
+All `npm` commands from the repo root. All `cargo` commands from `src-tauri/`.
 
-## Architecture
+---
 
-### STT modes (selectable in Settings → Providers)
-
-| Mode | Path | Requires |
-|------|------|----------|
-| **Local** | `useLocalTranscription` → `transcribe_local` → whisper-rs | Model downloaded once |
-| **API** | `useSpeechToText` → OpenAI `/audio/transcriptions` | API key + internet |
-
-### Audio pipeline
-
-```
-getUserMedia (16 kHz mono)
-  → ScriptProcessorNode (4096 buffer) → Float32Array chunks
-  → float32ToWav() → WAV Blob (16-bit PCM, 44-byte header)
-  → [local] Array.from(Uint8Array) → invoke("transcribe_local")
-  → [api]   File("audio.wav") → fetch /audio/transcriptions
-```
-
-### Text injection (macOS critical path)
-
-`type_text` runs on a `spawn_blocking` thread:
-1. Save clipboard → set text → `activate_prev_app()` → sleep 300ms
-2. `run_on_main_thread(simulate_paste_keystroke)` — **must be main thread**;
-   HIToolbox (`TSMGetInputSourceProperty`) crashes on macOS 14+ if called off-thread
-3. Wait on `mpsc::sync_channel` (3s timeout) → restore clipboard
-
-### Whisper model cache (`WhisperState`)
-
-`Arc<WhisperContext>` cached in `Mutex<WhisperModelCache>` as Tauri managed state.
-Model reloaded only when `model_id` changes. Arc lets it be cloned into `spawn_blocking`.
+## How it works
 
 ### Voice modal state machine
 
 ```
-idle → recording → transcribing → rephrasing → preview
-                                ↘ (rephrasing disabled) ↗
+idle → recording → transcribing → rephrasing → preview → (inject & close)
+                              ↘ (rephrasing off) ↗
 ```
 
-Window resizes: compact (118px) ↔ preview (240px) ↔ settings (390px).
+Window heights: **compact 118 px** (idle/recording) · **preview 240 px** · **settings 390 px**
 
-## Tauri Commands
+### Audio pipeline
 
-| Command | Purpose |
-|---------|---------|
-| `type_text(text)` | Clipboard paste with main-thread keyboard simulation |
-| `get_store_value(key)` | Read from `settings.json` store |
-| `set_store_value(key, value)` | Write to `settings.json` store |
-| `update_shortcut(shortcut)` | Re-register global hotkey + persist |
+```
+getUserMedia({ sampleRate: 16000, channelCount: 1 })
+  └─ ScriptProcessorNode (4096 buf) → Float32Array chunks
+       └─ float32ToWav() → 16-bit PCM WAV blob
+            ├─ [local]  Array.from(Uint8Array) → invoke("transcribe_local")
+            └─ [cloud]  File("audio.wav")      → fetch /audio/transcriptions
+```
+
+`ScriptProcessorNode` replaced `MediaRecorder` so both inference paths receive the same WAV format.
+
+### Text injection (macOS critical path)
+
+`type_text` runs on a `tokio::spawn_blocking` thread:
+1. Save clipboard → write text → `activate_prev_app()` → sleep 300 ms
+2. `app.run_on_main_thread(simulate_paste_keystroke)` — **must be on the main thread**;
+   HIToolbox (`TSMGetInputSourceProperty`) hard-crashes on macOS 14+ when called off-thread
+3. Block on `mpsc::sync_channel` (3 s timeout) → restore clipboard
+
+### Whisper model cache
+
+`WhisperContext` is wrapped in `Arc` and stored in a `Mutex<WhisperModelCache>` as Tauri managed state. The model is loaded once and reused; it only reloads when the selected `model_id` changes. The `Arc` lets the context be cloned into `spawn_blocking` closures without moving the lock.
+
+---
+
+## Tauri commands
+
+| Command | Description |
+|---------|-------------|
+| `type_text(text)` | Clipboard-paste with main-thread keyboard simulation |
+| `get_store_value(key)` | Read from `settings.json` |
+| `set_store_value(key, value)` | Write to `settings.json` |
+| `update_shortcut(shortcut)` | Re-register global hotkey and persist |
 | `get_local_model_status(modelId)` | Check if GGUF model file exists + size |
-| `download_local_model(modelId)` | Stream from HuggingFace, emit `model-download-progress` events |
+| `download_local_model(modelId)` | Stream model from HuggingFace, emit `model-download-progress` events |
 | `delete_local_model(modelId)` | Remove model file from disk |
-| `transcribe_local(audioWav, modelId)` | Run whisper.cpp inference, returns transcript |
-| `check_accessibility_permission()` | `AXIsProcessTrusted()` on macOS, `true` elsewhere |
-| `open_permission_settings(permissionType)` | Open System Settings to mic/accessibility pane |
+| `transcribe_local(audioWav, modelId)` | Run whisper.cpp inference, return transcript |
+| `check_accessibility_permission()` | `AXIsProcessTrusted()` on macOS; `true` on other platforms |
+| `open_permission_settings(permissionType)` | Open System Settings to mic / accessibility pane (macOS) |
 
-## Settings Schema
+---
 
-Stored in `settings.json` via `tauri-plugin-store`:
+## Settings schema
+
+Stored in `settings.json` via `tauri-plugin-store`. New keys are **merged** in `main.rs` on startup — existing values are never overwritten.
 
 ```json
 {
   "shortcut": "cmd+shift+v",
   "providers": {
-    "stt": { "base_url": "", "api_key": "", "model": "whisper-1" },
-    "llm": { "base_url": "", "api_key": "", "model": "gpt-4o-mini", "temperature": 0.3 }
+    "stt": { "base_url": "https://api.openai.com/v1", "api_key": "", "model": "whisper-1" },
+    "llm": { "base_url": "https://api.openai.com/v1", "api_key": "", "model": "gpt-4o-mini", "temperature": 0.3 }
   },
   "settings": {
     "silenceTimeoutMs": 3000,
     "sttMode": "api",
-    "localModel": "base"
+    "localModel": "base.en"
   }
 }
 ```
 
-`sttMode`: `"api"` (default, backward-compatible) | `"local"` (whisper.cpp, offline)  
-`localModel`: `"tiny"` (75 MB) | `"base"` (148 MB, default) | `"small"` (488 MB)
+`sttMode` — `"api"` (default, backward-compatible) | `"local"` (offline whisper.cpp)  
+`localModel` — see model table below; default is `"base.en"` on macOS, `"base"` elsewhere
 
-## Whisper Models
+---
+
+## Local whisper models
 
 Downloaded from `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{id}.bin`  
-Stored at `{app_data_dir}/whisper_models/ggml-{id}.bin`  
-macOS: `~/Library/Application Support/com.voicecodingassistant.app/whisper_models/`
+Stored at `{app_data_dir}/whisper_models/ggml-{id}.bin`
 
-## macOS Requirements
+| ID | Size | Language | Platform badge |
+|----|------|----------|----------------|
+| `tiny.en` | 75 MB | English only | macOS primary |
+| `base.en` | 148 MB | English only | **BEST FOR MAC** (default on macOS) |
+| `small.en` | 488 MB | English only | macOS primary |
+| `tiny` | 75 MB | Multilingual | Windows / Linux primary |
+| `base` | 148 MB | Multilingual | **RECOMMENDED** (default on Win/Linux) |
+| `small` | 488 MB | Multilingual | Windows / Linux primary |
 
-### Permissions (both required)
+English-only models are ~30 % smaller and faster because they skip the multilingual decoder. On macOS, whisper.cpp uses Metal automatically — no extra configuration needed. On Windows/Linux, CUDA is supported by recompiling with the `cuda` feature in `Cargo.toml`.
 
-**Microphone** — granted automatically on first recording via browser dialog.  
+---
+
+## LLM rephrasing
+
+System prompt converts raw dictation into precise coding instructions (removes filler words, adds technical specificity). Works with any OpenAI-compatible endpoint:
+
+- **OpenAI** — set base URL to `https://api.openai.com/v1`
+- **Ollama** — `http://localhost:11434/v1` (no API key needed)
+- **LM Studio** — `http://localhost:1234/v1`
+- **Any vLLM / compatible server** — set the base URL accordingly
+
+If `api_key` is empty the rephrasing step is silently skipped and the raw transcript is used.
+
+---
+
+## macOS setup
+
+### Permissions
+
+Both permissions are required for full functionality.
+
+**Microphone** — the OS dialog appears automatically on the first recording attempt.  
 Entitlement: `com.apple.security.device.audio-input`
 
-**Accessibility** — required for keyboard simulation (Cmd+V paste injection).  
-Must be granted manually: System Settings → Privacy & Security → Accessibility → add the binary.  
-In dev mode the binary is at `src-tauri/target/debug/voice-coding-assistant` (use Cmd+Shift+G in the file picker since it won't appear in the Applications list).
+**Accessibility** — required so `enigo` can simulate Cmd+V to paste text.  
+Must be granted manually:  
+`System Settings → Privacy & Security → Accessibility → +`  
 
-### Private API (dev mode)
+In **dev mode** the binary is not in `/Applications`. Use **Cmd+Shift+G** in the file picker and navigate to:
+```
+src-tauri/target/debug/voice-coding-assistant
+```
+In **production** the `.app` bundle appears in the list automatically after the first launch.
 
-`macOSPrivateApi: true` enables two WKWebView KVC keys in `main.rs`:
-- `mediaDevicesEnabled` → allows `navigator.mediaDevices` in WKWebView
-- `mediaCaptureRequiresSecureConnection: false` → allows mic without HTTPS
+### Private WebView API
 
-## Common Gotchas
+`macOSPrivateApi: true` is set in `tauri.conf.json`. This enables two WKWebView KVC keys in `main.rs`:
 
-- `simulate_paste_keystroke` **must** run on the main thread — HIToolbox crashes otherwise on macOS 14+
-- `whisper_rs::WhisperContext` is wrapped in `Arc` so it can be moved into `spawn_blocking` closures
-- `float32ToWav` output is accepted by both whisper.cpp (local) and OpenAI Whisper API (cloud)
-- `tauri-plugin-shell::open` is deprecated (use opener plugin in future); `#[allow(deprecated)]` suppresses the warning
-- `sttMode` defaults to `"api"` so existing users are unaffected when upgrading
-- Settings merging in `main.rs` (not `is_none()` guard) ensures new keys are added to existing stores without wiping old values
+| Key | Purpose |
+|-----|---------|
+| `mediaDevicesEnabled` | Allows `navigator.mediaDevices` inside WKWebView |
+| `mediaCaptureRequiresSecureConnection: false` | Allows mic access without HTTPS in dev mode |
 
-## LLM Rephrasing
+---
 
-System prompt optimizes spoken voice commands into precise coding instructions.
-Works with any OpenAI-compatible endpoint: OpenAI, Ollama (`localhost:11434/v1`), LM Studio, vLLM, etc.
-If `api_key` is empty, rephrasing is silently skipped and raw transcript is used.
+## Known gotchas
+
+| Situation | Detail |
+|-----------|--------|
+| `simulate_paste_keystroke` must run on main thread | HIToolbox asserts main-queue on macOS 14+; use `run_on_main_thread` + channel |
+| `WhisperContext` in `Arc` | Required to clone into `spawn_blocking` without moving the mutex guard |
+| WAV format for both paths | `float32ToWav` output is accepted by whisper.cpp and the OpenAI Whisper API |
+| `sttMode` defaults to `"api"` | Existing users upgrading are unaffected until they opt into local mode |
+| Settings merging, not guarding | `main.rs` uses `.or_insert()` per key so new fields are added without wiping old values |
+| `tauri-plugin-shell::open` deprecated | Suppressed with `#[allow(deprecated)]`; switch to `tauri-plugin-opener` when convenient |
+| Parakeet (CoreML) not implemented | Would require Swift sidecar or ONNX Runtime; whisper.cpp + Metal covers the use case well |

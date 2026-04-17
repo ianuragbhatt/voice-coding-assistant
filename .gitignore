@@ -50,3 +50,9 @@ capabilities/**
 *.temp
 .cache/
 .ruff_cache/
+
+# Reference repos (local only, not part of this project)
+Hex-main/
+
+# Claude Code session data (memory, plans, tasks)
+.claude/
